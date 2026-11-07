@@ -6,9 +6,10 @@ Creation Date: 10-27-2026
 File Name: i2c_master.v
 Purpose: I2C Master Module for RISCV Peripherals
 Revision History:
-- 10-27-2026: Initial skeleton implementation; Establish command/response framework; Add a commented FSM outline
-- 10-28-2026: Add Reset & Idle; Add I2C Clock Timing
-- 11-02-2026: Add SDA/SCL Synchronization; Adjust FSM phases & timing
+- 10-27-2026 — Initial skeleton implementation; Establish command/response framework; Add a commented FSM outline
+- 10-28-2026 — Add Reset; Add I2C Clock Timing
+- 11-02-2026 — Add SDA/SCL Synchronization; Adjust FSM phases & timing
+- 11-06-2026 — Add FSM logic for: IDLE, START, SLAVE_ACK, MASTER_ACK, RESPONSE
 ********************************************************* */
 
 // --------------------------------------------------------------------------------
@@ -36,10 +37,12 @@ Notes:
 - Multi-master arbitration, ten-bit addressing, and automatic bus recovery are outside the initial implementation scope.
 */
 // --------------------------------------------------------------------------------
+// ******************************************************* PARAMETERS OUTLINE *******************************************************
 module i2c_master #(
   /* Notes:
   Parameters are configuration constants not runtime input signals
   100 MHz is a default only (set CLK_HZ to the actual FPGA input clock)
+  100_000 = 100000; notation is for readability (functions the same)
   */
   parameter integer CLK_HZ = 100_000_000,
   parameter integer I2C_HZ = 100_000
@@ -153,9 +156,9 @@ module i2c_master #(
     - sda/scl_sync is the second stage that the FSM observes
     */
   reg sda_meta;
-  reg sda_sync;   // Read incoming data bits, detect slave ACK/NACK, and check for bus errors
+  reg sda_sync;
   reg scl_meta;
-  reg scl_sync;   // Detect when SCL actually reaches HIGH, inclduing after clock stretching
+  reg scl_sync;
 
 // SYNCHRONIZATION LOGC
 always @(posedge clk) begin
@@ -173,9 +176,9 @@ always @(posedge clk) begin
 end
 
 // ******************************************************* FSM OUTLINE *******************************************************
-  // FSM FRAMEWORK: BROAD OPERATIONS
+  // FSM FRAMEWORK: BROAD STATES
     /* Notes:
-    Your START / ADDR / R-W / ACK / DATA / STOP sequence describes a complete transaction.
+    START / ADDR / R-W / ACK / DATA / STOP sequence describes a complete transaction.
     Here WRITE handles an address byte OR any other outgoing byte.
     Distinguish receiving the slave's ACK from sending our ACK after a read.
 
@@ -186,11 +189,11 @@ end
     - between bytes the master may accept a command while bus_active is HIGH
     */
   localparam [3:0] ST_IDLE = 4'd0;
-  localparam [3:0] ST_START = 4'd1; // Also handles repeated START
+  localparam [3:0] ST_START = 4'd1;       // Also handles repeated START
   localparam [3:0] ST_WRITE = 4'd2;
-  localparam [3:0] ST_SLAVE_ACK = 4'd3; 
+  localparam [3:0] ST_SLAVE_ACK = 4'd3;   // Reads an acknowledgement (after ST_WRITE)
   localparam [3:0] ST_READ = 4'd4;
-  localparam [3:0] ST_MASTER_ACK = 4'd5;
+  localparam [3:0] ST_MASTER_ACK = 4'd5;  // Sends an acknowledgement (after ST_READ)
   localparam [3:0] ST_STOP = 4'd6;
   localparam [3:0] ST_RESPONSE = 4'd7;
   localparam [3:0] ST_ERROR = 4'd8;
@@ -204,10 +207,10 @@ end
     - Some phases wait for an external condition (e.g. scl_sync HIGH)
     */
     // Reusable Phases
-  localparam [2:0] PH_SETUP = 3'd0;     // Set SDA and wait setup time
-  localparam [2:0] PH_WAIT_HIGH = 3'd1; // Release SCL & wait until HIGH
-  localparam [2:0] PH_HIGH = 3'd2;      // Maintain HIGH interval
-  localparam [2:0] PH_LOW = 3'd3;       // Pull SCL LOW and finish
+  localparam [2:0] PH_SETUP = 3'd0;
+  localparam [2:0] PH_WAIT_HIGH = 3'd1;
+  localparam [2:0] PH_HIGH = 3'd2;
+  localparam [2:0] PH_LOW = 3'd3;
     //Specialized Phases
   localparam [2:0] PH_START_PREPARE = 3'd4;
   localparam [2:0] PH_START_HOLD = 3'd5;
@@ -227,16 +230,16 @@ end
     /* Notes:
     The I2C specification defines minimum setup and hold times for START, STOP, and data bits.
     - These are the minimum times that SDA must be stable before and after SCL transitions.
+    1_000_000 comes from converting seconds to microseconds
     */
     // Timing intervals for special I2C conditions
-  localparam integer START_HOLD_CYCLES = /* Derive from I2C requirements */;    // >= 4.0 us
-  localparam integer START_SETUP_CYCLES = /* Derive from I2C requirements */;   // >= 4.7 us
-  localparam integer STOP_SETUP_CYCLES = /* Derive from I2C requirements */;    // >= 4.0 us
-  localparam integer DATA_SETUP_CYCLES = /* Derive from I2C requirements */;    // >= 0.25 us
+  localparam integer START_HOLD_CYCLES = (CLK_HZ * 4.0)/1_000_000;  // >= 4.0 us
+  localparam integer START_SETUP_CYCLES = (CLK_HZ * 4.7)/1_000_000; // >= 4.7 us
+  localparam integer STOP_SETUP_CYCLES = (CLK_HZ * 4.0)/1_000_000;  // >= 4.0 us
+  localparam integer DATA_SETUP_CYCLES = (CLK_HZ * 0.25)/1_000_000; // >= 0.25 us
     // Timing intervals for repeated data-bit clocking
-  localparam integer SCL_HIGH_CYCLES = /* Derive from I2C requirements */;  // >= 4.0 us
-  localparam integer SCL_LOW_CYCLES = /* Derive from I2C requirements */;   // >= 4.7 us
-  // Insert additionals whenever.
+  localparam integer SCL_HIGH_CYCLES = (CLK_HZ * 4.0)/1_000_000;  // >= 4.0 us
+  localparam integer SCL_LOW_CYCLES = (CLK_HZ * 4.7)/1_000_000;   // >= 4.7 us
 
   // CLOCKED LOGIC OUTLINE
     /* Notes:
@@ -251,95 +254,371 @@ end
     clk_count determines WHEN SDA/SCL change occurs.
     FSM deterrmines WHAT changes to SDA/SCL occur. 
     Phase counter determines WHICH part of the timing interval is active.
-
-    State | Phase/Action | SDA | SCL | Notes
-    ST_IDLE | Wait for Command | Release if bus inactive; o/w hold | Release if bus inactive; o/w hold
-    ST_START | Prepare START | Release | Release | Initial START: wait for SDA & SCL HIGH; Repeated START: SDA already LOW (research later)
-    ~~~~~~~~ | generate START | Drive LOW | Hold released/HIGH | Confirm SCL HIGH before SDA falls
-    ~~~~~~~~ | START hold | Hold LOW | Hold HIGH | Wait START_HOLD_CYCLES
-    ~~~~~~~~ | Finish START | Hold LOW | Drive LOW | Complete LOW timing (prepare for next byte if applicable)
-    ST_WRITE | Data setup | Drive LOW for 0, release for 1 | Hold LOW | Wait data setup time
-    ~~~~~~~~ | SCL rising | Hold SDA stable | Release | Wait for scl_sync HIGH
-    ~~~~~~~~ | Data clock HIGH | Hold SDA stable | Hold released | Wait SCL_HIGH_CYCLES (maintain HIGH interval) (optionally monitor SCL)
-    ~~~~~~~~ | Data clock LOW | Hold SDA stable | Drive LOW | Wait SCL_LOW_CYCLES (complete LOW timing)
-    ST_SLAVE_ACK | Prepare ACK | Release | Hold LOW | Allow SDA to settle before clocking
-    ~~~~~~~~~~~~ | ACK clock HIGH | Release | Release | Wait for scl_sync HIGH
-    ~~~~~~~~~~~~ | Sample ACK | Release | Hold HIGH | Sample sda_sync: 0 = ACK ; 1 = NACK
-    ~~~~~~~~~~~~ | Finish ACK | Rlease | Drive LOW | Complete timing, store rsp_nack (prepare for next byte if applicable)
-    ST_READ | Prepare Receive bit | Release | Hold LOW | Slave controls SDA (waiting period)
-    ~~~~~~~ | SCL rising | Release | Release | Wait for scl_sync == 1
-    ~~~~~~~ | Sample data bit | Release | Hold HIGH | Sample sda_sync, shift into rx_shift_reg
-    ~~~~~~~ | Data clock LOW | Release | Drive LOW | Use latched cmd_nack to decide whether to drive SDA LOW for ACK or release for NACK
-    ST_MASTER_ACK | Prepare ACK/NACK | Drive LOW for ACK, release for NACK | Hold LOW | Use latched cmd_nack to decide whether to drive SDA LOW for ACK or release for NACK
-    ~~~~~~~~~~~~~ | ACK clock HIGH | Hold selected SDA level | Release| Wait for scl_sync == 1
-    ~~~~~~~~~~~~~ | Finish ACK/NACK | Hold selected SDA level | Drive LOW | Complete ninth clock; release SDA afterwards (prepare for next byte if applicable)
-    ST_STOP | Prepare STOP | Drive LOW | Hold LOW | Establish SDA LOW before SCL rises
-    ~~~~~~~ | SCL rising | Hold LOW | Release | Wait for scl_sync == 1
-    ~~~~~~~ | Generate STOP | Release | Hold HIGH | Wait STOP_SETUP_CYCLES
-    ~~~~~~~ | Bus free | Release | Release | Wait before another initial START (prepare for next transaction)
-    ST_RESPONSE | Wait for caller | Hold bus condition | Hold bus condition | Wait for response_accept (no new command until response accepted)
-    ST_ERROR | Handle fault | Depends on error | Depends on error | Check fault type, perform cleanup, and report error
     */
 
   // FSM OUTLINE
   always @(posedge clk) begin
-      if (rst) begin
-          /* Reset:
-          Set state to IDLE
-          Clear/Initialize internal registers
-          Clear active transactoin & response status
-          Release SDA & SCL lines
-          */
-          state <= ST_IDLE;
-          clk_count <= 0;
+    if (rst) begin
+      /* Reset:
+      Set state to IDLE
+      Clear/Initialize internal registers
+      Clear active transaction & response status
+      Release SDA & SCL lines
+      */
+      state <= ST_IDLE;
+      clk_count <= 0;
 
-          tx_shift_reg <= 8'd0;
-          rx_shift_reg <= 8'd0;
-          bit_index <= 3'd0;
-          rsp_valid <= 1'b0;
-          bus_active <= 1'b0;
+      tx_shift_reg <= 8'd0;
+      rx_shift_reg <= 8'd0;
+      bit_index <= 3'd0;
+      rsp_valid <= 1'b0;
+      bus_active <= 1'b0;
 
-          cmd_ready <= 1'b0;  // Do not accept commands during reset (ST_IDLE asserts when controller is allowed to accept command)
-          rsp_data <= 8'd0;
-          rsp_nack <= 1'b0;
-          rsp_error <= ERR_NONE;
+      cmd_ready <= 1'b0;  // Do not accept commands during reset (ST_IDLE asserts when controller is allowed to accept command)
+      rsp_data <= 8'd0;
+      rsp_nack <= 1'b0;
+      rsp_error <= ERR_NONE;
 
-          sda_drive_low <= 1'b0;
-          scl_drive_low <= 1'b0;
-      end else begin
-          case (state)
-              ST_IDLE: begin
-                  // placeholder
+      sda_drive_low <= 1'b0;
+      scl_drive_low <= 1'b0;
+    end else begin
+      case (state)
+        ST_IDLE: begin
+          if (command_accept) begin
+            // Clear the previous result when a new command is accepted.
+            rsp_valid <= 1'b0;
+            rsp_data <= 8'd0;
+            rsp_nack <= 1'b0;
+            rsp_error <= ERR_NONE;
+            // Start timing from zero
+            clk_count <= 10'd0;
+
+            opcode_latched <= cmd_opcode;   // Capture opcode
+            read_nack_latched <= cmd_nack;  // Capture NACK choice
+            cmd_ready <= 1'b0;              // Flag NOT ready to accept commands
+            case (cmd_opcode)               // Decide action based on command opcode
+              CMD_START: begin
+                state <= ST_START;
+                phase <= PH_START_PREPARE; // First phase of this operation
               end
-              ST_START: begin
-                  // placeholder
+              CMD_STOP: begin
+                if (bus_active) begin
+                  state <= ST_STOP;
+                  phase <= PH_SETUP;  // First phase of this operation
+                end else begin
+                  rsp_error <= ERR_COMMAND;
+                  state <= ST_ERROR;
+                end
               end
-              ST_WRITE: begin
-                  // placeholder
+              CMD_WRITE: begin
+                if (bus_active) begin
+                  state <= ST_WRITE;
+                  phase <= PH_SETUP;  // First phase of this operation
+                  bit_index <= 3'd7;        // Start with the MSB
+                  tx_shift_reg <= cmd_data; // Load the data to be sent
+                end else begin
+                  rsp_error <= ERR_COMMAND;
+                  state <= ST_ERROR;
+                end
               end
-              ST_SLAVE_ACK: begin
-                  // placeholder
-              end
-              ST_READ: begin
-                  // placeholder
-              end
-              ST_MASTER_ACK: begin
-                  // placeholder
-              end
-              ST_STOP: begin
-                  // placeholder
-              end
-              ST_RESPONSE: begin
-                  // placeholder
-              end
-              ST_ERROR: begin
-                  // placeholder
+              CMD_READ: begin
+                if (bus_active) begin
+                  state <= ST_READ;
+                  phase <= PH_SETUP;  // First phase of this operation
+                  bit_index <= 3'd7;    // Start with the MSB
+                  rx_shift_reg <= 8'd0; // Clear the receive register
+                end else begin
+                  rsp_error <= ERR_COMMAND;
+                  state <= ST_ERROR;
+                end
               end
               default: begin
-                  // Handle an invalid state without pretending success.
+                rsp_error <= ERR_COMMAND;
+                state <= ST_ERROR;
               end
+            endcase
+          end else begin
+            cmd_ready <= 1'b1;  // Flag ready to accept command
+          end
+        end
+        ST_START: begin
+          cmd_ready <= 1'b0;
+          case (phase)
+            PH_START_PREPARE: begin
+              sda_drive_low <= 1'b0;
+              if (!bus_active) begin
+                // Initial START: release both pins and observe bus free.
+                scl_drive_low <= 1'b0;
+                if (sda_sync && scl_sync) begin
+                  if (clk_count >= START_SETUP_CYCLES - 1) begin
+                    clk_count <= 10'd0;
+                    phase <= PH_HIGH;
+                  end else begin
+                    clk_count <= clk_count + 1'b1;
+                  end
+                end else begin
+                  clk_count <= 10'd0; // Require a continuous HIGH interval.
+                end
+              end else begin
+                // Repeated START: SDA must rise while SCL is still LOW.
+                // Raising SDA while SCL is HIGH would generate STOP.
+                scl_drive_low <= 1'b1;
+                if (!scl_sync && sda_sync) begin
+                  if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                    clk_count <= 10'd0;
+                    phase <= PH_WAIT_HIGH;
+                  end else begin
+                    clk_count <= clk_count + 1'b1;
+                  end
+                end else begin
+                  clk_count <= 10'd0;
+                end
+              end
+              // Possibility: Add a bounded timeout if the required levels never arrive
+            end
+            PH_WAIT_HIGH: begin
+              // Repeated START: release SCL; a slave may delay its rise.
+              sda_drive_low <= 1'b0;
+              scl_drive_low <= 1'b0;
+              clk_count <= 10'd0;
+              if (scl_sync && sda_sync) begin
+                phase <= PH_HIGH;
+              end
+              // Possibility: Time out if SCL/SDA cannot return HIGH
+            end
+            PH_HIGH: begin
+              // Ensure: Both pins are released
+              sda_drive_low <= 1'b0;
+              scl_drive_low <= 1'b0;
+              // Bus Error Check
+              if (!scl_sync || !sda_sync) begin
+                rsp_error <= ERR_BUS;
+                clk_count <= 10'd0;
+                state <= ST_ERROR;
+                // Count START setup AFTER SCL is observed HIGH.
+              end else if (clk_count >= START_SETUP_CYCLES - 1) begin
+                sda_drive_low <= 1'b1;  // SDA falls with SCL still HIGH: START.
+                bus_active <= 1'b1;     // Mark bus active only once START is generated.
+                clk_count <= 10'd0;
+                phase <= PH_START_HOLD; // Wait START_HOLD_CYCLES before letting SCL fall
+              end else begin
+                clk_count <= clk_count + 1'b1;
+              end
+            end
+            PH_START_HOLD: begin
+              // Ensure: SDA LOW and SCL released/HIGH after the START edge
+              sda_drive_low <= 1'b1;
+              scl_drive_low <= 1'b0;
+              // Bus Error Check
+              if (!scl_sync) begin
+                rsp_error <= ERR_BUS;
+                clk_count <= 10'd0;
+                state <= ST_ERROR;
+                // Wait HOLD cycles before letting SCL fall
+              end else if (clk_count >= START_HOLD_CYCLES - 1) begin
+                scl_drive_low <= 1'b1;
+                clk_count <= 10'd0;
+                phase <= PH_LOW;
+              end else begin
+                clk_count <= clk_count + 1'b1;
+              end
+            end
+            PH_LOW: begin
+              // Ensure: Both lines LOW
+              sda_drive_low <= 1'b1;
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                // Finish a full LOW interval before handing off the command
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  // Set Response Parameters
+                  rsp_data <= 8'd0;
+                  rsp_nack <= 1'b0;
+                  rsp_error <= ERR_NONE;
+                  rsp_valid <= 1'b1;      // Result is held and valid
+                  state <= ST_RESPONSE;   // Confirm START finished to sequencer
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0; // Wait for the observed SCL fall first
+              end
+              // Possibility: Add a timeout if the driven LOW is not observed
+            end
+            default: begin
+              rsp_error <= ERR_COMMAND;
+              clk_count <= 10'd0;
+              state <= ST_ERROR;
+            end
           endcase
-      end
+        end
+        ST_WRITE: begin
+          // PH_SETUP -> PH_WAIT_HIGH -> PH_HIGH -> PH_LOW for each of eight bits.
+          // Restart clk_count per timed phase; meet SDA setup and full SCL LOW/HIGH times.
+          // placeholder
+        end
+        ST_SLAVE_ACK: begin
+          cmd_ready <= 1'b0;
+          sda_drive_low <= 1'b0;  // Release SDA for peripheral control
+          case (phase)
+            PH_SETUP: begin
+              // Ensure: SCL LOW
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  scl_drive_low <= 1'b0;  // Release SCL
+                  phase <= PH_WAIT_HIGH;  // Confirm SCL HIGH
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            PH_WAIT_HIGH: begin
+              // Ensure: SCL HIGH
+              scl_drive_low <= 1'b0;
+              clk_count <= 10'd0;
+              if (scl_sync) begin
+                phase <= PH_HIGH;
+              end
+            end
+            PH_HIGH: begin
+              // Ensure: SCL HIGH
+              scl_drive_low <= 1'b0;
+              // Bus Error Check
+              if (!scl_sync) begin
+                rsp_error <= ERR_BUS;
+                clk_count <= 10'd0;
+                state <= ST_ERROR;
+              // Wait HIGH cycles
+              end else if (clk_count >= SCL_HIGH_CYCLES - 1) begin
+                rsp_nack <= sda_sync;   // Read NACK from peripheral
+                scl_drive_low <= 1'b1;
+                clk_count <= 10'd0;
+                phase <= PH_LOW;
+              end else begin
+                clk_count <= clk_count + 1'b1;
+              end
+            end
+            PH_LOW: begin
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  rsp_data <= 8'd0;
+                  rsp_error <= ERR_NONE;
+                  rsp_valid <= 1'b1;
+                  state <= ST_RESPONSE;
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            default: begin
+              rsp_error <= ERR_COMMAND;
+              clk_count <= 10'd0;
+              state <= ST_ERROR;
+            end
+          endcase
+        end
+        ST_READ: begin
+          // Repeat setup/wait-HIGH/HIGH/LOW phases with SDA released for eight bits.
+          // Sample once per bit during HIGH; restart clk_count at timed phase changes.
+          // placeholder
+        end
+        ST_MASTER_ACK: begin
+          cmd_ready <= 1'b0;
+          case (phase)
+            PH_SETUP: begin
+              scl_drive_low <= 1'b1;  // Ensure: SCL LOW
+              if (!scl_sync) begin
+                sda_drive_low <= !read_nack_latched;  // Write acknowledgement to SDA
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  scl_drive_low <= 1'b0;
+                  phase <= PH_WAIT_HIGH;
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            PH_WAIT_HIGH: begin
+              sda_drive_low <= !read_nack_latched;
+              scl_drive_low <= 1'b0;
+              clk_count <= 10'd0;
+              if (scl_sync) begin
+                phase <= PH_HIGH;
+              end
+            end
+            PH_HIGH: begin
+              sda_drive_low <= !read_nack_latched;
+              scl_drive_low <= 1'b0;
+              if (!scl_sync) begin
+                rsp_error <= ERR_BUS;
+                clk_count <= 10'd0;
+                state <= ST_ERROR;
+              end else if (clk_count >= SCL_HIGH_CYCLES - 1) begin
+                scl_drive_low <= 1'b1;
+                clk_count <= 10'd0;
+                phase <= PH_LOW;
+              end else begin
+                clk_count <= clk_count + 1'b1;
+              end
+            end
+            PH_LOW: begin
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                sda_drive_low <= 1'b0;
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  rsp_data <= rx_shift_reg;
+                  rsp_nack <= 1'b0;
+                  rsp_error <= ERR_NONE;
+                  rsp_valid <= 1'b1;
+                  state <= ST_RESPONSE;
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            default: begin
+              rsp_error <= ERR_COMMAND;
+              clk_count <= 10'd0;
+              state <= ST_ERROR;
+            end
+          endcase
+        end
+        ST_STOP: begin
+          // PH_SETUP establishes SDA LOW; PH_WAIT_HIGH waits for observed SCL HIGH.
+          // Wait STOP_SETUP_CYCLES BEFORE PH_STOP_RELEASE releases SDA; then time bus free.
+          /* Future Notes:
+          Set bus_active <= 1'b0;
+          */
+        end
+        ST_RESPONSE: begin
+          // Check if caller accepts response
+          if (response_accept) begin
+            rsp_valid <= 1'b0;
+            state <= ST_IDLE;
+          end
+        end
+        ST_ERROR: begin
+          // Error response itself needs no bus timing; timed cleanup needs an entry phase
+          // and cleared counter. Bound waits with a timeout (maximum allowed wait).
+          // placeholder
+        end
+        default: begin
+          // Handle an invalid state without pretending success.
+        end
+      endcase
+    end
   end
-
 endmodule
