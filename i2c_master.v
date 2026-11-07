@@ -10,6 +10,7 @@ Revision History:
 - 10-28-2026 — Add Reset; Add I2C Clock Timing
 - 11-02-2026 — Add SDA/SCL Synchronization; Adjust FSM phases & timing
 - 11-06-2026 — Add FSM logic for: IDLE, START, SLAVE_ACK, MASTER_ACK, RESPONSE
+- 11-07-2026 — Add FSM logic for: WRITE, READ, STOP, ERROR, default
 ********************************************************* */
 
 // --------------------------------------------------------------------------------
@@ -453,9 +454,70 @@ end
           endcase
         end
         ST_WRITE: begin
-          // PH_SETUP -> PH_WAIT_HIGH -> PH_HIGH -> PH_LOW for each of eight bits.
-          // Restart clk_count per timed phase; meet SDA setup and full SCL LOW/HIGH times.
-          // placeholder
+          cmd_ready <= 1'b0;
+          case (phase)
+            PH_SETUP: begin
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                sda_drive_low <= ~tx_shift_reg[bit_index];
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  scl_drive_low <= 1'b0;
+                  phase <= PH_WAIT_HIGH;
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            PH_WAIT_HIGH: begin
+              scl_drive_low <= 1'b0;
+              clk_count <= 10'd0;
+              if (scl_sync) begin
+                phase <= PH_HIGH;
+              end
+            end
+            PH_HIGH: begin
+              scl_drive_low <= 1'b0;
+              if (!scl_sync) begin
+                rsp_error <= ERR_BUS;
+                clk_count <= 10'd0;
+                state <= ST_ERROR;
+              end else if (clk_count >= SCL_HIGH_CYCLES - 1) begin
+                scl_drive_low <= 1'b1;
+                clk_count <= 10'd0;
+                phase <= PH_LOW;
+              end else begin
+                clk_count <= clk_count + 1'b1;
+              end
+            end
+            PH_LOW: begin
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  phase <= PH_SETUP;
+                  // Finished ALL bits
+                  if (bit_index == 3'd0) begin
+                    state <= ST_SLAVE_ACK;
+                  // NOT finished
+                  end else begin
+                    bit_index <= bit_index - 1'b1;
+                  end
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            default: begin
+              rsp_error <= ERR_COMMAND;
+              clk_count <= 10'd0;
+              state <= ST_ERROR;
+            end
+          endcase
         end
         ST_SLAVE_ACK: begin
           cmd_ready <= 1'b0;
@@ -526,9 +588,69 @@ end
           endcase
         end
         ST_READ: begin
-          // Repeat setup/wait-HIGH/HIGH/LOW phases with SDA released for eight bits.
-          // Sample once per bit during HIGH; restart clk_count at timed phase changes.
-          // placeholder
+          cmd_ready <= 1'b0;
+          sda_drive_low <= 1'b0;  // Release SDA for slave transaction
+          case (phase)
+            PH_SETUP: begin
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  scl_drive_low <= 1'b0;
+                  phase <= PH_WAIT_HIGH;
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            PH_WAIT_HIGH: begin
+              scl_drive_low <= 1'b0;
+              clk_count <= 10'd0;
+              if (scl_sync) begin
+                phase <= PH_HIGH;
+              end
+            end
+            PH_HIGH: begin
+              scl_drive_low <= 1'b0;
+              if (!scl_sync) begin
+                rsp_error <= ERR_BUS;
+                clk_count <= 10'd0;
+                state <= ST_ERROR;
+              end else if (clk_count >= SCL_HIGH_CYCLES - 1) begin
+                rx_shift_reg[bit_index] <= sda_sync;
+                scl_drive_low <= 1'b1;
+                clk_count <= 10'd0;
+                phase <= PH_LOW;
+              end else begin
+                clk_count <= clk_count + 1'b1;
+              end
+            end
+            PH_LOW: begin
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  phase <= PH_SETUP;
+                  if (bit_index == 3'd0) begin
+                    state <= ST_MASTER_ACK;
+                  end else begin
+                    bit_index <= bit_index - 1'b1;
+                  end
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            default: begin
+              rsp_error <= ERR_COMMAND;
+              clk_count <= 10'd0;
+              state <= ST_ERROR;
+            end
+          endcase
         end
         ST_MASTER_ACK: begin
           cmd_ready <= 1'b0;
@@ -597,11 +719,79 @@ end
           endcase
         end
         ST_STOP: begin
-          // PH_SETUP establishes SDA LOW; PH_WAIT_HIGH waits for observed SCL HIGH.
-          // Wait STOP_SETUP_CYCLES BEFORE PH_STOP_RELEASE releases SDA; then time bus free.
-          /* Future Notes:
-          Set bus_active <= 1'b0;
-          */
+          cmd_ready <= 1'b0;
+          case (phase)
+            PH_SETUP: begin
+              scl_drive_low <= 1'b1;
+              if (!scl_sync) begin
+                sda_drive_low <= 1'b1;
+                if (!sda_sync) begin
+                  if (clk_count >= SCL_LOW_CYCLES - 1) begin
+                    clk_count <= 10'd0;
+                    scl_drive_low <= 1'b0;
+                    phase <= PH_WAIT_HIGH;
+                  end else begin
+                    clk_count <= clk_count + 1'b1;
+                  end
+                end else begin
+                  clk_count <= 10'd0;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            PH_WAIT_HIGH: begin
+              sda_drive_low <= 1'b1;
+              scl_drive_low <= 1'b0;
+              clk_count <= 10'd0;
+              if (scl_sync) begin
+                phase <= PH_HIGH;
+              end
+            end
+            PH_HIGH: begin
+              sda_drive_low <= 1'b1;
+              scl_drive_low <= 1'b0;
+              if (!scl_sync || sda_sync) begin
+                rsp_error <= ERR_BUS;
+                clk_count <= 10'd0;
+                state <= ST_ERROR;
+              end else if (clk_count >= STOP_SETUP_CYCLES - 1) begin
+                sda_drive_low <= 1'b0;
+                clk_count <= 10'd0;
+                phase <= PH_STOP_RELEASE;
+              end else begin
+                clk_count <= clk_count + 1'b1;
+              end
+            end
+            PH_STOP_RELEASE: begin
+              scl_drive_low <= 1'b0;
+              sda_drive_low <= 1'b0;
+              if (!scl_sync) begin
+                rsp_error <= ERR_BUS;
+                clk_count <= 10'd0;
+                state <= ST_ERROR;
+              end else if (sda_sync) begin
+                bus_active <= 1'b0;
+                if (clk_count >= START_SETUP_CYCLES - 1) begin
+                  clk_count <= 10'd0;
+                  rsp_data <= 8'd0;
+                  rsp_nack <= 1'b0;
+                  rsp_error <= ERR_NONE;
+                  rsp_valid <= 1'b1;
+                  state <= ST_RESPONSE;
+                end else begin
+                  clk_count <= clk_count + 1'b1;
+                end
+              end else begin
+                clk_count <= 10'd0;
+              end
+            end
+            default: begin
+              rsp_error <= ERR_COMMAND;
+              clk_count <= 10'd0;
+              state <= ST_ERROR;
+            end
+          endcase
         end
         ST_RESPONSE: begin
           // Check if caller accepts response
@@ -611,12 +801,33 @@ end
           end
         end
         ST_ERROR: begin
-          // Error response itself needs no bus timing; timed cleanup needs an entry phase
-          // and cleared counter. Bound waits with a timeout (maximum allowed wait).
-          // placeholder
+          cmd_ready <= 1'b0;
+          clk_count <= 10'd0;
+          case (rsp_error)
+            ERR_COMMAND: begin
+              rsp_error <= ERR_COMMAND;
+            end
+            ERR_TIMEOUT, ERR_BUS: begin
+              sda_drive_low <= 1'b0;
+              scl_drive_low <= 1'b0;
+              bus_active <= 1'b0;
+            end
+            default: begin
+              rsp_error <= ERR_COMMAND;
+              sda_drive_low <= 1'b0;
+              scl_drive_low <= 1'b0;
+              bus_active <= 1'b0;
+            end
+          endcase
+          rsp_data <= 8'd0;
+          rsp_nack <= 1'b0;
+          rsp_valid <= 1'b1;
+          state <= ST_RESPONSE;
         end
         default: begin
-          // Handle an invalid state without pretending success.
+          cmd_ready <= 1'b0;
+          rsp_error <= ERR_BUS;
+          state <= ST_ERROR;
         end
       endcase
     end
