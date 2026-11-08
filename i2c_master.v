@@ -218,21 +218,17 @@ end
   localparam [2:0] PH_STOP_RELEASE = 3'd6;
   reg[2:0] phase;
 
-  // TIMING COUNTERS
+  // TIMING REQUIREMENTS
     /* Notes:
     Uses placeholder clock frequency during isolation design.
     - Later replace with FPGA/RISCV clock frequency.
-    */
-  localparam integer SCL_PERIOD = CLK_HZ/I2C_HZ;      // 1000
-  localparam integer SCL_HALF_PERIOD = SCL_PERIOD/2;  // 500
-  reg [9:0] clk_count;
-
-  // TIMING REQUIREMENTS
-    /* Notes:
     The I2C specification defines minimum setup and hold times for START, STOP, and data bits.
     - These are the minimum times that SDA must be stable before and after SCL transitions.
     1_000_000 comes from converting seconds to microseconds
     */
+    // SCL Period
+  localparam integer SCL_PERIOD = CLK_HZ/I2C_HZ;      // 1000
+  localparam integer SCL_HALF_PERIOD = SCL_PERIOD/2;  // 500
     // Timing intervals for special I2C conditions
   localparam integer START_HOLD_CYCLES = (CLK_HZ * 4.0)/1_000_000;  // >= 4.0 us
   localparam integer START_SETUP_CYCLES = (CLK_HZ * 4.7)/1_000_000; // >= 4.7 us
@@ -241,6 +237,11 @@ end
     // Timing intervals for repeated data-bit clocking
   localparam integer SCL_HIGH_CYCLES = (CLK_HZ * 4.0)/1_000_000;  // >= 4.0 us
   localparam integer SCL_LOW_CYCLES = (CLK_HZ * 4.7)/1_000_000;   // >= 4.7 us
+    // Timeout interval
+  localparam integer TIMOUT_CYCLES = CLK_HZ / 1_000;  // ~1ms (subject to change)
+    // Counters
+  reg [9:0] clk_count;
+  reg [16:0] timeout_count;
 
   // CLOCKED LOGIC OUTLINE
     /* Notes:
@@ -375,7 +376,6 @@ end
                   clk_count <= 10'd0;
                 end
               end
-              // Possibility: Add a bounded timeout if the required levels never arrive
             end
             PH_WAIT_HIGH: begin
               // Repeated START: release SCL; a slave may delay its rise.
@@ -385,7 +385,6 @@ end
               if (scl_sync && sda_sync) begin
                 phase <= PH_HIGH;
               end
-              // Possibility: Time out if SCL/SDA cannot return HIGH
             end
             PH_HIGH: begin
               // Ensure: Both pins are released
@@ -396,7 +395,7 @@ end
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
                 state <= ST_ERROR;
-                // Count START setup AFTER SCL is observed HIGH.
+                // Count START setup AFTER SCL is observed HIGH
               end else if (clk_count >= START_SETUP_CYCLES - 1) begin
                 sda_drive_low <= 1'b1;  // SDA falls with SCL still HIGH: START.
                 bus_active <= 1'b1;     // Mark bus active only once START is generated.
@@ -444,7 +443,6 @@ end
               end else begin
                 clk_count <= 10'd0; // Wait for the observed SCL fall first
               end
-              // Possibility: Add a timeout if the driven LOW is not observed
             end
             default: begin
               rsp_error <= ERR_COMMAND;
