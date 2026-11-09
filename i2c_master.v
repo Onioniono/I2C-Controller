@@ -11,6 +11,7 @@ Revision History:
 - 11-02-2026 — Add SDA/SCL Synchronization; Adjust FSM phases & timing
 - 11-06-2026 — Add FSM logic for: IDLE, START, SLAVE_ACK, MASTER_ACK, RESPONSE
 - 11-07-2026 — Add FSM logic for: WRITE, READ, STOP, ERROR, default
+- 11-08-2026 — Add timeout logic
 ********************************************************* */
 
 // --------------------------------------------------------------------------------
@@ -46,7 +47,9 @@ module i2c_master #(
   100_000 = 100000; notation is for readability (functions the same)
   */
   parameter integer CLK_HZ = 100_000_000,
-  parameter integer I2C_HZ = 100_000
+  parameter integer I2C_HZ = 100_000,
+  // Maximum duration of one accepted command (including clock stretching)
+  parameter integer TIMEOUT_MS = 1
 )(
   input wire clk,   // Clock for every internal always block
   input wire rst,   // Planned active-high synchronous reset
@@ -226,9 +229,6 @@ end
     - These are the minimum times that SDA must be stable before and after SCL transitions.
     1_000_000 comes from converting seconds to microseconds
     */
-    // SCL Period
-  localparam integer SCL_PERIOD = CLK_HZ/I2C_HZ;      // 1000
-  localparam integer SCL_HALF_PERIOD = SCL_PERIOD/2;  // 500
     // Timing intervals for special I2C conditions
   localparam integer START_HOLD_CYCLES = (CLK_HZ * 4.0)/1_000_000;  // >= 4.0 us
   localparam integer START_SETUP_CYCLES = (CLK_HZ * 4.7)/1_000_000; // >= 4.7 us
@@ -237,11 +237,13 @@ end
     // Timing intervals for repeated data-bit clocking
   localparam integer SCL_HIGH_CYCLES = (CLK_HZ * 4.0)/1_000_000;  // >= 4.0 us
   localparam integer SCL_LOW_CYCLES = (CLK_HZ * 4.7)/1_000_000;   // >= 4.7 us
-    // Timeout interval
-  localparam integer TIMOUT_CYCLES = CLK_HZ / 1_000;  // ~1ms (subject to change)
+    // Command timeout; independent of I2C bit/phase timing (Round up to clk cycles)
+  localparam [63:0] TIMEOUT_CYCLES = (CLK_HZ > 0 && TIMEOUT_MS > 0) ? ((64'd1 * CLK_HZ * TIMEOUT_MS + 64'd999) / 64'd1000) : 64'd1;
+  localparam integer TIMEOUT_WIDTH = (TIMEOUT_CYCLES > 1) ? $clog2(TIMEOUT_CYCLES) : 1;
     // Counters
   reg [9:0] clk_count;
-  reg [16:0] timeout_count;
+  reg [TIMEOUT_WIDTH-1:0] timeout_count;
+  reg command_finished;
 
   // CLOCKED LOGIC OUTLINE
     /* Notes:
@@ -260,6 +262,8 @@ end
 
   // FSM OUTLINE
   always @(posedge clk) begin
+    command_finished = 1'b0;
+    // Reset Logic
     if (rst) begin
       /* Reset:
       Set state to IDLE
@@ -269,6 +273,7 @@ end
       */
       state <= ST_IDLE;
       clk_count <= 0;
+      timeout_count <= 0;
 
       tx_shift_reg <= 8'd0;
       rx_shift_reg <= 8'd0;
@@ -309,6 +314,7 @@ end
                   phase <= PH_SETUP;  // First phase of this operation
                 end else begin
                   rsp_error <= ERR_COMMAND;
+                  command_finished = 1'b1;
                   state <= ST_ERROR;
                 end
               end
@@ -320,6 +326,7 @@ end
                   tx_shift_reg <= cmd_data; // Load the data to be sent
                 end else begin
                   rsp_error <= ERR_COMMAND;
+                  command_finished = 1'b1;
                   state <= ST_ERROR;
                 end
               end
@@ -331,11 +338,13 @@ end
                   rx_shift_reg <= 8'd0; // Clear the receive register
                 end else begin
                   rsp_error <= ERR_COMMAND;
+                  command_finished = 1'b1;
                   state <= ST_ERROR;
                 end
               end
               default: begin
                 rsp_error <= ERR_COMMAND;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
               end
             endcase
@@ -394,6 +403,7 @@ end
               if (!scl_sync || !sda_sync) begin
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
                 // Count START setup AFTER SCL is observed HIGH
               end else if (clk_count >= START_SETUP_CYCLES - 1) begin
@@ -413,6 +423,7 @@ end
               if (!scl_sync) begin
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
                 // Wait HOLD cycles before letting SCL fall
               end else if (clk_count >= START_HOLD_CYCLES - 1) begin
@@ -436,6 +447,7 @@ end
                   rsp_nack <= 1'b0;
                   rsp_error <= ERR_NONE;
                   rsp_valid <= 1'b1;      // Result is held and valid
+                  command_finished = 1'b1;
                   state <= ST_RESPONSE;   // Confirm START finished to sequencer
                 end else begin
                   clk_count <= clk_count + 1'b1;
@@ -447,6 +459,7 @@ end
             default: begin
               rsp_error <= ERR_COMMAND;
               clk_count <= 10'd0;
+              command_finished = 1'b1;
               state <= ST_ERROR;
             end
           endcase
@@ -481,6 +494,7 @@ end
               if (!scl_sync) begin
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
               end else if (clk_count >= SCL_HIGH_CYCLES - 1) begin
                 scl_drive_low <= 1'b1;
@@ -513,6 +527,7 @@ end
             default: begin
               rsp_error <= ERR_COMMAND;
               clk_count <= 10'd0;
+              command_finished = 1'b1;
               state <= ST_ERROR;
             end
           endcase
@@ -551,6 +566,7 @@ end
               if (!scl_sync) begin
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
               // Wait HIGH cycles
               end else if (clk_count >= SCL_HIGH_CYCLES - 1) begin
@@ -570,6 +586,7 @@ end
                   rsp_data <= 8'd0;
                   rsp_error <= ERR_NONE;
                   rsp_valid <= 1'b1;
+                  command_finished = 1'b1;
                   state <= ST_RESPONSE;
                 end else begin
                   clk_count <= clk_count + 1'b1;
@@ -581,6 +598,7 @@ end
             default: begin
               rsp_error <= ERR_COMMAND;
               clk_count <= 10'd0;
+              command_finished = 1'b1;
               state <= ST_ERROR;
             end
           endcase
@@ -615,6 +633,7 @@ end
               if (!scl_sync) begin
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
               end else if (clk_count >= SCL_HIGH_CYCLES - 1) begin
                 rx_shift_reg[bit_index] <= sda_sync;
@@ -646,6 +665,7 @@ end
             default: begin
               rsp_error <= ERR_COMMAND;
               clk_count <= 10'd0;
+              command_finished = 1'b1;
               state <= ST_ERROR;
             end
           endcase
@@ -682,6 +702,7 @@ end
               if (!scl_sync) begin
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
               end else if (clk_count >= SCL_HIGH_CYCLES - 1) begin
                 scl_drive_low <= 1'b1;
@@ -701,6 +722,7 @@ end
                   rsp_nack <= 1'b0;
                   rsp_error <= ERR_NONE;
                   rsp_valid <= 1'b1;
+                  command_finished = 1'b1;
                   state <= ST_RESPONSE;
                 end else begin
                   clk_count <= clk_count + 1'b1;
@@ -712,6 +734,7 @@ end
             default: begin
               rsp_error <= ERR_COMMAND;
               clk_count <= 10'd0;
+              command_finished = 1'b1;
               state <= ST_ERROR;
             end
           endcase
@@ -752,6 +775,7 @@ end
               if (!scl_sync || sda_sync) begin
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
               end else if (clk_count >= STOP_SETUP_CYCLES - 1) begin
                 sda_drive_low <= 1'b0;
@@ -767,6 +791,7 @@ end
               if (!scl_sync) begin
                 rsp_error <= ERR_BUS;
                 clk_count <= 10'd0;
+                command_finished = 1'b1;
                 state <= ST_ERROR;
               end else if (sda_sync) begin
                 bus_active <= 1'b0;
@@ -776,6 +801,7 @@ end
                   rsp_nack <= 1'b0;
                   rsp_error <= ERR_NONE;
                   rsp_valid <= 1'b1;
+                  command_finished = 1'b1;
                   state <= ST_RESPONSE;
                 end else begin
                   clk_count <= clk_count + 1'b1;
@@ -787,6 +813,7 @@ end
             default: begin
               rsp_error <= ERR_COMMAND;
               clk_count <= 10'd0;
+              command_finished = 1'b1;
               state <= ST_ERROR;
             end
           endcase
@@ -820,14 +847,36 @@ end
           rsp_data <= 8'd0;
           rsp_nack <= 1'b0;
           rsp_valid <= 1'b1;
+          command_finished = 1'b1;
           state <= ST_RESPONSE;
         end
         default: begin
           cmd_ready <= 1'b0;
           rsp_error <= ERR_BUS;
+          command_finished = 1'b1;
           state <= ST_ERROR;
         end
       endcase
+      // TIMEOUT LOGIC
+      /*
+      Notes:
+      Acceptance occurs in IDLE:
+      - Clear the counter there
+      - then count elapsed cycles until command finishes
+      - Waiting for the caller is not timed
+      */
+      if (command_finished || state == ST_IDLE || state == ST_RESPONSE || state == ST_ERROR) begin
+        timeout_count <= 0;
+      end else if (timeout_count >= TIMEOUT_CYCLES - 1) begin
+        timeout_count <= 0;
+        cmd_ready <= 1'b0;
+        rsp_valid <= 1'b0;
+        rsp_error <= ERR_TIMEOUT;
+        clk_count <= 10'd0;
+        state <= ST_ERROR;
+      end else begin
+        timeout_count <= timeout_count + 1'b1;
+      end
     end
   end
 endmodule
