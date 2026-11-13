@@ -9,6 +9,7 @@ Revision History:
 - 10-27-2026 — Create file
 - 11-09-2026 — Instantiate i2c_master; Outline Tasks
 - 11-12-2026 — Add: tasks; basic test logic; timeout
+- 11-13-2026 — Test: Vivado Behavioral Simulation
 ********************************************************* */
 
 `timescale 1ns/1ps
@@ -21,6 +22,16 @@ Purpose:
 Notes:
 - Vivado: add this file to Simulation Sources; add the master to Design Sources
     - Select i2c_master_tb as simulation top, then Run Behavioral Simulation / Run All
+Simulation Results (log):
+    Time resolution is 1 ps
+    TEST: START
+    TEST: WRITE one byte, slave ACK
+    TEST: repeated START
+    TEST: READ one byte, master ACK
+    TEST: READ final byte, master NACK
+    TEST: STOP
+    PASS: 41 checks, 6 response handshakes
+    $finish called at time : 413500 ns : File "C:/Users/---/Project Archive/EE198/I2C-Controller/tb/i2c_master_tb.v" Line 251
 */
 // --------------------------------------------------------------------------------
 // ******************************************************* TESTBENCH *******************************************************
